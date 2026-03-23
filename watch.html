@@ -232,10 +232,22 @@
 const SPLAY_BASE = 'https://hub.splay.id';
 const SPLAY_KEY  = 'sk_live_2355bb1f4e3cca896b15f6a740e377af95bcc4ad114833f7';
 
-const splayFetch = (path) =>
-  fetch(`${SPLAY_BASE}${path}`, {
-    headers: { 'Authorization': `Bearer ${SPLAY_KEY}`, 'Content-Type': 'application/json' }
+// Deteksi apakah dibuka dari file:// (lokal)
+const IS_LOCAL_FILE = location.protocol === 'file:';
+
+// Jika file://, gunakan CORS proxy agar fetch ke API tidak diblokir browser
+const splayFetch = (path) => {
+  const fullUrl = SPLAY_BASE + path;
+  const fetchUrl = IS_LOCAL_FILE
+    ? `https://corsproxy.io/?${encodeURIComponent(fullUrl)}`
+    : fullUrl;
+  return fetch(fetchUrl, {
+    headers: {
+      'Authorization': `Bearer ${SPLAY_KEY}`,
+      'Content-Type': 'application/json'
+    }
   });
+};
 
 const params  = new URLSearchParams(location.search);
 const ANIME_ID = params.get('id') || '';

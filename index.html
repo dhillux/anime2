@@ -429,13 +429,22 @@
 const SPLAY_BASE = 'https://hub.splay.id';
 const SPLAY_KEY  = 'sk_live_2355bb1f4e3cca896b15f6a740e377af95bcc4ad114833f7';
 
-const splayFetch = (path) =>
-  fetch(`${SPLAY_BASE}${path}`, {
+// Deteksi apakah dibuka dari file:// (lokal)
+const IS_LOCAL_FILE = location.protocol === 'file:';
+
+// Jika file://, gunakan CORS proxy agar fetch ke API tidak diblokir browser
+const splayFetch = (path) => {
+  const fullUrl = SPLAY_BASE + path;
+  const fetchUrl = IS_LOCAL_FILE
+    ? `https://corsproxy.io/?${encodeURIComponent(fullUrl)}`
+    : fullUrl;
+  return fetch(fetchUrl, {
     headers: {
       'Authorization': `Bearer ${SPLAY_KEY}`,
       'Content-Type': 'application/json'
     }
   });
+};
 
 /* ── STATE ── */
 let currentSection = 'season';
@@ -639,7 +648,13 @@ async function loadSection() {
     console.error('SPlay fetch error:', e);
     document.getElementById('animeGrid').innerHTML = '';
     document.getElementById('animeError').style.display = 'block';
-    document.getElementById('errorMsg').textContent = e.message || 'Gagal memuat. Coba lagi.';
+    const isFileProto = location.protocol === 'file:';
+    const isCORS = e.message === 'Failed to fetch' || e.message?.includes('CORS');
+    let errMsg = e.message || 'Gagal memuat. Coba lagi.';
+    if (isCORS && isFileProto) {
+      errMsg = 'Koneksi diblokir browser (CORS). Sedang mencoba proxy... Jika masih gagal, coba upload file ke hosting atau gunakan VS Code Live Server.';
+    }
+    document.getElementById('errorMsg').textContent = errMsg;
     document.getElementById('resultCount').textContent = 'Error';
   }
 }

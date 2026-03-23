@@ -232,22 +232,47 @@
 const SPLAY_BASE = 'https://hub.splay.id';
 const SPLAY_KEY  = 'sk_live_2355bb1f4e3cca896b15f6a740e377af95bcc4ad114833f7';
 
-// Deteksi apakah dibuka dari file:// (lokal)
-const IS_LOCAL_FILE = location.protocol === 'file:';
+const JIKAN_BASE = 'https://api.jikan.moe/v4';
 
-// Jika file://, gunakan CORS proxy agar fetch ke API tidak diblokir browser
-const splayFetch = (path) => {
+// Coba SPlay langsung → corsproxy → allorigins
+const splayFetch = async (path) => {
   const fullUrl = SPLAY_BASE + path;
-  const fetchUrl = IS_LOCAL_FILE
-    ? `https://corsproxy.io/?${encodeURIComponent(fullUrl)}`
-    : fullUrl;
-  return fetch(fetchUrl, {
-    headers: {
-      'Authorization': `Bearer ${SPLAY_KEY}`,
-      'Content-Type': 'application/json'
-    }
-  });
+  const hdrs = { 'Authorization': `Bearer ${SPLAY_KEY}`, 'x-api-key': SPLAY_KEY };
+  const attempts = [
+    () => fetch(fullUrl, { headers: hdrs }),
+    () => fetch(`https://corsproxy.io/?${encodeURIComponent(fullUrl)}`, { headers: hdrs }),
+    () => fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(fullUrl)}`)
+  ];
+  for (const attempt of attempts) {
+    try {
+      const res = await attempt();
+      if (res.ok) return res;
+    } catch(e) {}
+  }
+  throw new Error('SPlay tidak dapat dijangkau');
 };
+
+// Jikan: fallback untuk info anime (pakai MAL ID jika numerik)
+async function jikanAnimeInfo() {
+  if (!/^\d+$/.test(ANIME_ID)) return null;
+  const res = await fetch(`${JIKAN_BASE}/anime/${ANIME_ID}/full`);
+  if (!res.ok) throw new Error(`Jikan ${res.status}`);
+  const jd = (await res.json()).data;
+  return {
+    id: ANIME_ID, name: jd.title_english || jd.title,
+    cover_url: jd.images?.jpg?.large_image_url || '',
+    available_episodes: jd.episodes || 0,
+    anilist_data: {
+      averageScore: jd.score ? Math.round(jd.score * 10) : null,
+      status: jd.status === 'Currently Airing' ? 'RELEASING' : 'FINISHED',
+      countryOfOrigin: 'JP',
+      genres: (jd.genres || []).map(g => g.name),
+      description: jd.synopsis,
+      seasonYear: jd.year, season: jd.season, format: jd.type,
+      studios: (jd.studios || []).map(s => s.name)
+    }
+  };
+}
 
 const params  = new URLSearchParams(location.search);
 const ANIME_ID = params.get('id') || '';
@@ -276,10 +301,17 @@ async function init() {
 /* ── ANIME INFO ── */
 async function loadAnimeInfo() {
   try {
-    const res  = await splayFetch(`/api/anime/${ANIME_ID}`);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const raw  = await res.json();
-    const a    = raw.data || raw;
+    let a;
+    try {
+      const res = await splayFetch(`/api/anime/${ANIME_ID}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const raw = await res.json();
+      a = raw.data || raw;
+    } catch(eSplay) {
+      console.warn('SPlay info gagal, pakai Jikan:', eSplay.message);
+      a = await jikanAnimeInfo();
+      if (!a) throw eSplay;
+    }
 
     const title   = a.name || TITLE;
     const score   = a.anilist_data?.averageScore;
@@ -315,40 +347,72 @@ async function loadAnimeInfo() {
   }
 }
 
+/* ── JIKAN EPISODE FALLBACK ── */
+// Jikan doesn't give stream URLs but gives episode list structure
+async function jikanEpisodes(malId) {
+  if (!/^\d+$/.test(malId)) return [];
+  const res = await fetch(`${JIKAN_BASE}/anime/${malId}/episodes`);
+  if (!res.ok) return [];
+  const data = await res.json();
+  const eps = data.data || [];
+  return eps.map(ep => ({
+    episode_number: ep.mal_id,
+    number: ep.mal_id,
+    title: ep.title || ep.title_romanji || `Episode ${ep.mal_id}`,
+    thumbnail_url: ep.images?.jpg?.image_url || null,
+    has_subtitle_id: false,
+    subtitle_tracks: []
+  }));
+}
+
 /* ── EPISODE LIST ── */
 async function loadEpisodes() {
   try {
-    // Load all episodes (try up to page 5 if paginated)
-    let page = 1;
     let allEps = [];
-    let total_pages = 1;
+    let splayOk = false;
 
-    do {
-      const res  = await splayFetch(`/api/anime/${ANIME_ID}/episodes?page=${page}&per_page=100`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
+    // Try SPlay episodes
+    try {
+      let page = 1, total_pages = 1;
+      do {
+        const res = await splayFetch(`/api/anime/${ANIME_ID}/episodes?page=${page}&per_page=100`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        const list = Array.isArray(data) ? data : (data.data || []);
+        total_pages = data.meta?.total_pages || 1;
+        allEps = [...allEps, ...list];
+        page++;
+      } while (page <= total_pages && page <= 5);
+      if (allEps.length) splayOk = true;
+    } catch(eSplay) {
+      console.warn('SPlay episodes gagal, coba Jikan:', eSplay.message);
+    }
 
-      const list = Array.isArray(data) ? data : (data.data || []);
-      total_pages = data.meta?.total_pages || 1;
-      allEps = [...allEps, ...list];
-      page++;
-    } while (page <= total_pages && page <= 5);
+    // Jikan fallback for episode list
+    if (!allEps.length) {
+      allEps = await jikanEpisodes(ANIME_ID);
+    }
 
     allEpisodes = allEps;
     filteredEps = allEps;
 
     if (!allEps.length) {
-      showEpError('Episode belum tersedia untuk anime ini.');
+      showEpError('Episode belum tersedia untuk anime ini di SPlay maupun Jikan.');
       return;
     }
 
     document.getElementById('epCount').textContent = `${allEps.length} Ep`;
     renderEpisodeList(allEps);
 
-    // Auto-play first episode
-    if (allEps.length > 0) {
+    // Auto-play first episode (only if SPlay available for streams)
+    if (allEps.length > 0 && splayOk) {
       const firstEp = allEps[0];
-      playEpisode(firstEp.episode_number || firstEp.number || firstEp.id || 1);
+      playEpisode(firstEp.episode_number || firstEp.number || 1);
+    } else if (allEps.length > 0) {
+      // SPlay not available, show info
+      document.getElementById('playerPlaceholder').innerHTML = `
+        <i class="bi bi-collection-play"></i>
+        <p>Pilih episode untuk mencoba stream.<br><small style="opacity:.5">SPlay tidak dapat dijangkau — stream mungkin tidak tersedia</small></p>`;
     }
 
   } catch(e) {

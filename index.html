@@ -422,28 +422,50 @@
 <script src="js/main.js"></script>
 <script>
 /* ═══════════════════════════════════════════════════
-   AnimeVerse — SPlay API Integration
-   Base: https://hub.splay.id
-   Key:  sk_live_2355bb1f4e3cca896b15f6a740e377af95bcc4ad114833f7
+   AnimeVerse — SPlay API + Jikan Fallback
+   SPlay: https://hub.splay.id
+   Key:   sk_live_2355bb1f4e3cca896b15f6a740e377af95bcc4ad114833f7
+   Jikan: https://api.jikan.moe/v4 (fallback, no key needed)
 ════════════════════════════════════════════════════ */
 const SPLAY_BASE = 'https://hub.splay.id';
 const SPLAY_KEY  = 'sk_live_2355bb1f4e3cca896b15f6a740e377af95bcc4ad114833f7';
+const JIKAN_BASE = 'https://api.jikan.moe/v4';
 
-// Deteksi apakah dibuka dari file:// (lokal)
-const IS_LOCAL_FILE = location.protocol === 'file:';
+// Gunakan CORS proxy jika bukan dari server production
+// (file://, localhost, 127.x.x.x, dll)
+const needsProxy = () =>
+  location.protocol === 'file:' ||
+  location.hostname === 'localhost' ||
+  location.hostname === '127.0.0.1' ||
+  location.hostname.startsWith('192.168.');
 
-// Jika file://, gunakan CORS proxy agar fetch ke API tidak diblokir browser
-const splayFetch = (path) => {
+// Coba SPlay dulu, jika gagal fallback ke Jikan
+let usingSplay = true;
+
+const splayFetch = async (path) => {
   const fullUrl = SPLAY_BASE + path;
-  const fetchUrl = IS_LOCAL_FILE
-    ? `https://corsproxy.io/?${encodeURIComponent(fullUrl)}`
-    : fullUrl;
-  return fetch(fetchUrl, {
-    headers: {
-      'Authorization': `Bearer ${SPLAY_KEY}`,
-      'Content-Type': 'application/json'
-    }
-  });
+  // Coba langsung dulu
+  const attempts = [
+    // 1. Direct (works if SPlay allows CORS from this origin)
+    () => fetch(fullUrl, {
+      headers: { 'Authorization': `Bearer ${SPLAY_KEY}`, 'x-api-key': SPLAY_KEY }
+    }),
+    // 2. Via corsproxy.io
+    () => fetch(`https://corsproxy.io/?${encodeURIComponent(fullUrl)}`, {
+      headers: { 'Authorization': `Bearer ${SPLAY_KEY}`, 'x-api-key': SPLAY_KEY }
+    }),
+    // 3. Via allorigins
+    () => fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(fullUrl)}`, {
+      headers: { 'Authorization': `Bearer ${SPLAY_KEY}`, 'x-api-key': SPLAY_KEY }
+    })
+  ];
+  for (const attempt of attempts) {
+    try {
+      const res = await attempt();
+      if (res.ok) return res;
+    } catch(e) { /* try next */ }
+  }
+  throw new Error('Semua proxy gagal');
 };
 
 /* ── STATE ── */
@@ -621,42 +643,86 @@ function buildUrl() {
   return `/api/anime/season?${params}`; // default: seasonal
 }
 
+/* ── JIKAN FALLBACK: map SPlay sections to Jikan ── */
+async function loadFromJikan() {
+  const J = JIKAN_BASE;
+  const page = currentPage;
+  const lim = currentPerPage;
+  let url;
+  if (currentSection === 'search')   url = `${J}/anime?q=${encodeURIComponent(currentQuery)}&page=${page}&limit=${lim}&sfw=true`;
+  else if (currentSection === 'popular')  url = `${J}/top/anime?page=${page}&limit=${lim}`;
+  else if (currentSection === 'latest')   url = `${J}/anime?status=airing&page=${page}&limit=${lim}&order_by=start_date&sort=desc`;
+  else if (currentSection === 'upcoming') url = `${J}/anime?status=upcoming&page=${page}&limit=${lim}`;
+  else /* season */                        url = `${J}/seasons/now?page=${page}&limit=${lim}`;
+
+  const res  = await fetch(url);
+  if (!res.ok) throw new Error(`Jikan HTTP ${res.status}`);
+  const data = await res.json();
+  const rawList = data.data || [];
+
+  // Normalize Jikan data to SPlay-like shape
+  const list = rawList.map(a => ({
+    id: String(a.mal_id),
+    name: a.title_english || a.title,
+    cover_url: a.images?.jpg?.large_image_url || a.images?.jpg?.image_url || '',
+    available_episodes: a.episodes || 0,
+    anilist_data: {
+      averageScore: a.score ? Math.round(a.score * 10) : null,
+      status: a.status === 'Currently Airing' ? 'RELEASING' : a.status === 'Finished Airing' ? 'FINISHED' : 'NOT_YET_RELEASED',
+      countryOfOrigin: 'JP',
+      genres: (a.genres || []).map(g => g.name),
+      description: a.synopsis || '',
+      seasonYear: a.year,
+      season: a.season,
+      format: a.type,
+      studios: (a.studios || []).map(s => s.name)
+    }
+  }));
+
+  const total = data.pagination?.items?.total || list.length;
+  totalPages = data.pagination?.last_visible_page || 1;
+  return { list, total };
+}
+
 /* ── LOAD ── */
 async function loadSection() {
   showSkeletons(currentPerPage);
   document.getElementById('animeError').style.display = 'none';
   const url = buildUrl();
-  try {
-    const res  = await splayFetch(url);
-    if (!res.ok) {
-      const err = await res.text();
-      throw new Error(`HTTP ${res.status}: ${err.slice(0,100)}`);
-    }
-    const data = await res.json();
 
-    // SPlay returns { data: [...], meta: { total, total_pages, ... } }
-    const list = Array.isArray(data) ? data : (data.data || []);
+  // Try SPlay first, fallback to Jikan
+  let list = [], total = 0;
+  let source = 'SPlay';
+
+  try {
+    const res = await splayFetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    list = Array.isArray(data) ? data : (data.data || []);
     const meta = data.meta || {};
     totalPages = meta.total_pages || 1;
-    const total = meta.total || list.length;
+    total = meta.total || list.length;
 
-    renderGrid(list);
-    renderPagination();
-    document.getElementById('resultCount').textContent = `${total.toLocaleString('id-ID')} anime`;
-
-  } catch(e) {
-    console.error('SPlay fetch error:', e);
-    document.getElementById('animeGrid').innerHTML = '';
-    document.getElementById('animeError').style.display = 'block';
-    const isFileProto = location.protocol === 'file:';
-    const isCORS = e.message === 'Failed to fetch' || e.message?.includes('CORS');
-    let errMsg = e.message || 'Gagal memuat. Coba lagi.';
-    if (isCORS && isFileProto) {
-      errMsg = 'Koneksi diblokir browser (CORS). Sedang mencoba proxy... Jika masih gagal, coba upload file ke hosting atau gunakan VS Code Live Server.';
+  } catch(eSplay) {
+    console.warn('SPlay gagal, mencoba Jikan...', eSplay.message);
+    source = 'Jikan';
+    try {
+      const result = await loadFromJikan();
+      list = result.list;
+      total = result.total;
+    } catch(eJikan) {
+      console.error('Jikan juga gagal:', eJikan);
+      document.getElementById('animeGrid').innerHTML = '';
+      document.getElementById('animeError').style.display = 'block';
+      document.getElementById('errorMsg').textContent = `Semua sumber gagal. Periksa koneksi internet kamu. (${eJikan.message})`;
+      document.getElementById('resultCount').textContent = 'Error';
+      return;
     }
-    document.getElementById('errorMsg').textContent = errMsg;
-    document.getElementById('resultCount').textContent = 'Error';
   }
+
+  renderGrid(list);
+  renderPagination();
+  document.getElementById('resultCount').textContent = `${total.toLocaleString('id-ID')} anime (via ${source})`;
 }
 function retryLoad() { loadSection(); }
 
@@ -716,10 +782,44 @@ async function openDetail(animeId, evt) {
   document.body.style.overflow = 'hidden';
 
   try {
-    const res  = await splayFetch(`/api/anime/${animeId}`);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const a    = await res.json();
-    const data = a.data || a; // some endpoints wrap in .data
+    // Try SPlay detail
+    let data;
+    try {
+      const res = await splayFetch(`/api/anime/${animeId}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const raw = await res.json();
+      data = raw.data || raw;
+    } catch(eSplay) {
+      // Fallback: try Jikan if animeId looks like a MAL id (numeric)
+      if (/^\d+$/.test(animeId)) {
+        const res = await fetch(`${JIKAN_BASE}/anime/${animeId}/full`);
+        if (!res.ok) throw new Error(`Jikan HTTP ${res.status}`);
+        const jData = (await res.json()).data;
+        // Normalize to SPlay shape
+        data = {
+          id: String(jData.mal_id),
+          name: jData.title_english || jData.title,
+          cover_url: jData.images?.jpg?.large_image_url || '',
+          available_episodes: jData.episodes || 0,
+          trailer_url: jData.trailer?.embed_url || null,
+          anilist_data: {
+            averageScore: jData.score ? Math.round(jData.score * 10) : null,
+            status: jData.status === 'Currently Airing' ? 'RELEASING' : 'FINISHED',
+            countryOfOrigin: 'JP',
+            genres: (jData.genres || []).map(g => g.name),
+            description: jData.synopsis || '',
+            seasonYear: jData.year,
+            season: jData.season,
+            format: jData.type,
+            studios: (jData.studios || []).map(s => s.name),
+            title: { english: jData.title_english }
+          }
+        };
+      } else {
+        throw eSplay;
+      }
+    }
+    const a = data; // some endpoints wrap in .data
 
     addToHistory({ id: animeId, name: data.name, cover_url: data.cover_url, anilist_data: data.anilist_data });
 
@@ -805,15 +905,33 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal()
 /* ── TICKER: load latest anime titles ── */
 async function loadTicker() {
   try {
-    const res  = await splayFetch('/api/anime/latest-update?per_page=15&origin=jp');
-    if (!res.ok) return;
-    const data = await res.json();
-    const list = Array.isArray(data) ? data : (data.data || []);
-    if (!list.length) return;
-    const doubled = [...list, ...list];
-    document.getElementById('tickerContent').innerHTML = doubled.map(a =>
-      `<span class="ticker-item">${a.name}</span>`).join('');
-  } catch(e) {}
+    // Try SPlay first
+    let names = [];
+    try {
+      const res = await splayFetch('/api/anime/latest-update?per_page=15&origin=jp');
+      if (res.ok) {
+        const data = await res.json();
+        const list = Array.isArray(data) ? data : (data.data || []);
+        names = list.map(a => a.name).filter(Boolean);
+      }
+    } catch(e) {}
+
+    // Fallback to Jikan if SPlay failed
+    if (!names.length) {
+      const res = await fetch(`${JIKAN_BASE}/anime?status=airing&limit=15&order_by=members&sort=desc`);
+      if (res.ok) {
+        const data = await res.json();
+        names = (data.data || []).map(a => a.title_english || a.title);
+      }
+    }
+
+    if (!names.length) return;
+    const doubled = [...names, ...names];
+    document.getElementById('tickerContent').innerHTML = doubled.map(n =>
+      `<span class="ticker-item">${n}</span>`).join('');
+  } catch(e) {
+    console.warn('Ticker load failed:', e);
+  }
 }
 
 /* ── URL PARAM (deep link) ── */
